@@ -1,0 +1,6 @@
+tensorflow==2.0.0-beta0
+numpy
+flask
+flask-cors
+flask-restful
+gunicorn
