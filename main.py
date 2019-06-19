@@ -18,7 +18,72 @@ embedding_dim = 256
 hidden_units = 1024
 attention_units = 16
 epochs = 32
+def preprocess_sentence(msg):
+    msg = msg.replace('\n', ' ').lower()
+    msg = msg.replace("\xc2\xa0", "")
+    msg = re.sub('([\(\).,!?])', "", msg)
+    msg = re.sub(" +"," ", msg)
+    return msg
 
+def softmax_choose(a, weights):
+    exps = np.exp(weights - np.max(weights))
+    scaled_exps = exps / np.sum(exps)
+    return np.random.choice(a, p=scaled_exps)
+
+class Bot:
+    def __init__(self, word_list, encoder, decoder):
+        self.encoder = encoder
+        self.decoder = decoder
+        self.word_list = word_list
+        
+    def encode(self, sentence):
+        inputs = [self.word_list.index(i) for i in sentence.split(' ') if i in self.word_list]
+        inputs = tf.keras.preprocessing.sequence.pad_sequences([inputs],
+                                                               maxlen=max_length,
+                                                               padding='post')
+        inputs = tf.convert_to_tensor(inputs)
+        return inputs
+
+    def predict(self, inputs):
+        result = []
+
+        hidden = [tf.zeros((1, hidden_units))]
+        print(self.encoder.embedding.input_dim)
+        enc_out, enc_hidden = self.encoder(inputs, hidden)
+
+        dec_hidden = enc_hidden
+        dec_input = tf.expand_dims([self.word_list.index('<padding>')], 0)
+        for t in range(max_length):
+            predictions, dec_hidden, attention_weights = self.decoder(dec_input,
+                                                                 dec_hidden,
+                                                                 enc_out)
+            options = 8 if t == 0 else 1
+            top_prediction_indices = tf.argsort(predictions[0])[::-1][:options]
+            top_confidences = []
+            for index in top_prediction_indices:
+                top_confidences.append(float(predictions[0][index]))
+            top_confidences = np.array(top_confidences)
+            predicted_id = softmax_choose(top_prediction_indices, top_confidences)
+
+            result.append(predicted_id)
+            if self.word_list[predicted_id] == '<eos>':
+                return result
+
+            # the predicted ID is fed back into the model
+            dec_input = tf.expand_dims([predicted_id], 0)
+
+        return result
+
+    def decode(self, outputs):
+        return " ".join([self.word_list[w] for w in outputs if self.word_list[w] != "<eos>" and self.word_list[w] != "<padding>"])
+
+    def evaluate(self, sentence):
+        sentence = preprocess_sentence(sentence)
+        inputs = self.encode(sentence)
+        outputs = self.predict(inputs)
+        response = self.decode(outputs)
+
+        return sentence, response
 class Encoder(tf.keras.Model):
     def __init__(self, vocab_size, embedding_dim, enc_units, batch_sz):
         super(Encoder, self).__init__()
@@ -110,81 +175,48 @@ checkpoint = tf.train.Checkpoint(optimizer=optimizer,
                                  decoder=decoder)
 
 checkpoint.restore(str(Path("data") / "model"))
+AlexBot = Bot(word_list, encoder, decoder)
 
-def preprocess_sentence(msg):
-    msg = msg.replace('\n', ' ').lower()
-    msg = msg.replace("\xc2\xa0", "")
-    msg = re.sub('([\(\).,!?])', "", msg)
-    msg = re.sub(" +"," ", msg)
-    return msg
+with open(Path("data") / "word_list_reverse.txt", "rb") as f:
+    word_list_rev = pickle.load(f)
 
-def softmax_choose(a, weights):
-    exps = np.exp(weights - np.max(weights))
-    scaled_exps = exps / np.sum(exps)
-    return np.random.choice(a, p=scaled_exps)
+vocab_size_rev = len(word_list_rev)
+encoder_rev = Encoder(vocab_size_rev, embedding_dim, hidden_units, batch_size)
+decoder_rev = Decoder(vocab_size_rev, embedding_dim, hidden_units, batch_size)
+optimizer_rev = tf.optimizers.Adam()
 
-def encode(sentence):
-    inputs = [word_list.index(i) for i in sentence.split(' ') if i in word_list]
-    inputs = tf.keras.preprocessing.sequence.pad_sequences([inputs],
-                                                           maxlen=max_length,
-                                                           padding='post')
-    inputs = tf.convert_to_tensor(inputs)
-    return inputs
+checkpoint_rev = tf.train.Checkpoint(optimizer=optimizer_rev,
+                                     encoder=encoder_rev,
+                                     decoder=decoder_rev)
 
-def predict(inputs):
-    result = []
+checkpoint_rev.restore(str(Path("data") / "model_rev"))
 
-    hidden = [tf.zeros((1, hidden_units))]
-    enc_out, enc_hidden = encoder(inputs, hidden)
-
-    dec_hidden = enc_hidden
-    dec_input = tf.expand_dims([word_list.index('<padding>')], 0)
-
-    for t in range(max_length):
-        predictions, dec_hidden, attention_weights = decoder(dec_input,
-                                                             dec_hidden,
-                                                             enc_out)
-        options = 8 if t == 0 else 1
-        top_prediction_indices = tf.argsort(predictions[0])[::-1][:options]
-        top_confidences = []
-        for index in top_prediction_indices:
-            top_confidences.append(float(predictions[0][index]))
-        top_confidences = np.array(top_confidences) 
-        predicted_id = softmax_choose(top_prediction_indices, top_confidences)
-        
-        result.append(predicted_id)
-        if word_list[predicted_id] == '<eos>':
-            return result
-
-        # the predicted ID is fed back into the model
-        dec_input = tf.expand_dims([predicted_id], 0)
-
-    return result
-
-def decode(outputs):
-    return " ".join([word_list[w] for w in outputs if word_list[w] != "<eos>" and word_list[w] != "<padding>"])
-
-def evaluate(sentence):
-    sentence = preprocess_sentence(sentence)
-    inputs = encode(sentence)
-    outputs = predict(inputs)
-    response = decode(outputs)
-
-    return sentence, response
+OtherBot = Bot(word_list_rev, encoder_rev, decoder_rev)
 
 app = Flask(__name__)
 cors = CORS(app)
 app.config["CORS_HEADERS"] = "Content-Type"
 
-@app.route("/Chat", methods=["POST"])
+@app.route("/ChatAlex", methods=["POST"])
 @cross_origin()
-def chat():
+def chatAlex():
     if not request.json:
         return jsonify({"message": "ERR: must send JSON"})
     if 'msg' not in request.json.keys():
         return jsonify({"message": "ERR: field msg must be in JSON"})
-    response = evaluate(str(request.json["msg"]))[1]
+    response = AlexBot.evaluate(str(request.json["msg"]))[1]
     return jsonify({"data": response})
+
+@app.route("/ChatOther", methods=["POST"])
+@cross_origin()
+def chatOther():
+    if not request.json:
+        return jsonify({"message": "ERR: must send JSON"})
+    if 'msg' not in request.json.keys():
+        return jsonify({"message": "ERR: field msg must be in JSON"})
+    response = OtherBot.evaluate(str(request.json["msg"]))[1]
+    return jsonify({"data": response})
+
 
 @app.route("/")
 def hello():
